@@ -10,28 +10,21 @@ import { NodeVM } from 'vm2';
 import * as puppeteer from 'puppeteer';
 import { setInterval } from 'timers';
 import * as bodyParser from 'body-parser';
-
 import {
   screenshot as screenshotSchema,
   content as contentSchema,
   pdf as pdfSchema,
   fn as fnSchema,
 } from './schemas';
-
-import {
-  IResourceLoad,
-  debug,
-  asyncMiddleware,
-  generateChromeTarget,
-  getMachineStats,
-  bodyValidation,
-} from './util';
+import { debug, asyncMiddleware, generateChromeTarget, bodyValidation } from './utils';
+import { IResourceLoad, getMachineStats, isMachineConstrained } from './hardware-monitoring';
+import { IFileRequest } from './models/file-request.interface';
+import { IBrowserlessOptions } from './models/browserless-options.interface';
 
 const request = require('request');
 const queue = require('queue');
 
-const fnLoader = (fnName: string) =>
-  fs.readFileSync(path.join(__dirname, '..', 'functions', `${fnName}.js`), 'utf8');
+const fnLoader = (fnName: string) => fs.readFileSync(path.join(__dirname, '..', 'functions', `${fnName}.js`), 'utf8');
 
 // Browserless fn's
 const screenshot = fnLoader('screenshot');
@@ -43,42 +36,9 @@ const protocol = require('../protocol.json');
 const hints = require('../hints.json');
 
 const thiryMinutes = 30 * 60 * 1000;
-const fiveMinute = 5 * 60 * 1000;
+const fiveMinutes = 5 * 60 * 1000;
 const halfSecond = 500;
 const maxStats = 12 * 24 * 7; // 7 days @ 5-min intervals
-
-export interface IOptions {
-  connectionTimeout: number;
-  port: number;
-  maxConcurrentSessions: number;
-  maxQueueLength: number;
-  prebootChrome: boolean;
-  demoMode: boolean;
-  enableDebugger: boolean;
-  maxMemory: number;
-  maxCPU: number;
-  autoQueue: boolean;
-  token: string | null;
-  rejectAlertURL: string | null;
-  queuedAlertURL: string | null;
-  timeoutAlertURL: string | null;
-  healthFailureURL: string | null;
-}
-
-interface IStats {
-  date: number | null;
-  successful: number;
-  error: number;
-  queued: number;
-  rejected: number;
-  memory: number;
-  cpu: number;
-  timedout: number;
-};
-
-interface IFileRequest extends express.Request {
-  file: any
-}
 
 export class Chrome {
   public port: number;
@@ -89,6 +49,7 @@ export class Chrome {
   public maxMemory: number;
   public maxCPU: number;
   public autoQueue: boolean;
+  public keepAlive: boolean;
 
   private proxy: any;
   private prebootChrome: boolean;
@@ -104,11 +65,11 @@ export class Chrome {
   readonly timeoutHook: Function;
   readonly healthFailureHook: Function;
 
-  private stats: IStats[];
-  private currentStat: IStats;
+  private stats: IBrowserlessStats[];
+  private currentStat: IBrowserlessStats;
   private currentMachineStats: IResourceLoad;
 
-  constructor(opts: IOptions) {
+  constructor(opts: IBrowserlessOptions) {
     this.port = opts.port;
     this.maxConcurrentSessions = opts.maxConcurrentSessions;
     this.maxQueueLength = opts.maxQueueLength + opts.maxConcurrentSessions;
@@ -120,6 +81,7 @@ export class Chrome {
     this.maxCPU = opts.maxCPU;
     this.maxMemory = opts.maxMemory;
     this.autoQueue = opts.autoQueue;
+    this.keepAlive = opts.keepAlive;
 
     this.chromeSwarm = [];
     this.stats = [];
@@ -202,12 +164,14 @@ export class Chrome {
       for (let i = 0; i < this.maxConcurrentSessions; i++) {
         this.chromeSwarm.push(this.launchChrome());
       }
+
+      debug(`Prebooted chrome swarm: ${this.maxConcurrentSessions} chrome instances are ready`);
     }
 
     this.resetCurrentStat();
 
     setInterval(this.recordMachineStats.bind(this), halfSecond);
-    setInterval(this.recordMetrics.bind(this), fiveMinute);
+    setInterval(this.recordMetrics.bind(this), fiveMinutes);
   }
 
   private onTimedOut(next, job) {
@@ -286,12 +250,12 @@ export class Chrome {
   }
 
   private onSessionComplete() {
-    this.currentStat.successful = this.currentStat.successful + 1;
+    this.currentStat.successful++;
     this.addToChromeSwarm();
   }
 
   private onSessionFail() {
-    this.currentStat.error = this.currentStat.error + 1;
+    this.currentStat.error++;
     this.addToChromeSwarm();
   }
 
@@ -304,13 +268,6 @@ export class Chrome {
     if (socket.destroy) {
       socket.destroy();
     }
-  }
-
-  private isMachineConstrained() {
-    return (
-      this.currentMachineStats.cpuUsage >= this.maxCPU ||
-      this.currentMachineStats.memoryUsage >= this.maxMemory
-    );
   }
 
   private async launchChrome(flags:string[] = [], retries:number = 1): Promise<puppeteer.Browser> {
@@ -338,7 +295,7 @@ export class Chrome {
 
   private async runFunction({ code, context, req, res }) {
     const queueLength = this.queue.length;
-    const isMachineStrained = this.isMachineConstrained();
+    const isMachineStrained = isMachineConstrained(this.currentMachineStats);
 
     if (queueLength >= this.maxQueueLength) {
       return this.rejectReq(req, res, `Too Many Requests`);
@@ -357,16 +314,24 @@ export class Chrome {
 
     debug(`${req.url}: Inbound function execution: ${JSON.stringify({ code, context })}`);
 
-    const job:any = async () => {
-      const browser = await this.launchChrome();
+    const job: any = async () => {
+      const launchPromise = this.chromeSwarm.length > 0 ? 
+      this.chromeSwarm.shift() :
+      this.launchChrome();
+
+      const browser = await launchPromise as puppeteer.Browser;
       const page = await browser.newPage();
 
       job.browser = browser;
 
       return handler({ page, context })
         .then(({ data, type }) => {
-          debug(`${req.url}: Function complete, stopping Chrome`);
-          _.attempt(() => browser.close());
+          debug(`${req.url}: Function complete, cleaning up.`);
+
+          this.keepAlive ? 
+            _.attempt(() => { page.close(); this.chromeSwarm.push(Promise.resolve(browser)) }) : 
+            _.attempt(() => browser.close());
+          
 
           res.type(type || 'text/plain');
 
@@ -389,7 +354,18 @@ export class Chrome {
 
     job.close = () => {
       if (job.browser) {
-        job.browser.close();
+        if (this.keepAlive) {
+          job.browser.pages()
+          .then((pages: puppeteer.Page[]) => {
+            pages.forEach(page => page.close());
+          })
+          .finally(() => {
+            this.chromeSwarm.push(Promise.resolve(job.browser));
+          });
+        } else {
+          job.browser.close();
+        }
+        
       }
 
       if (!res.headersSent) {
@@ -398,9 +374,19 @@ export class Chrome {
     };
 
     req.on('close', () => {
+      debug(`${req.url}: Request has terminated, cleaning up.`);
       if (job.browser) {
-        debug(`${req.url}: Request has terminated, stopping Chrome.`);
-        job.browser.close();
+        if (this.keepAlive) {
+          job.browser.pages()
+          .then((pages: puppeteer.Page[]) => {
+            pages.forEach(page => page.close());
+          })
+          .finally(() => {
+            this.chromeSwarm.push(Promise.resolve(job.browser));
+          });
+        } else {
+          job.browser.close();
+        }
       }
     });
 
@@ -479,7 +465,7 @@ export class Chrome {
       });
     });
 
-    // function rout for executing pupeteer scripts, accepts a JSON body with
+    // function route for executing puppeteer scripts, accepts a JSON body with
     // code and context
     app.post('/function', bodyValidation(fnSchema), asyncMiddleware(async (req, res) => {
       const { code, context } = req.body;
@@ -544,7 +530,7 @@ export class Chrome {
         const parsedUrl = url.parse(req.url, true);
         const route = parsedUrl.pathname || '/';
         const queueLength = this.queue.length;
-        const isMachineStrained = this.isMachineConstrained();
+        const isMachineStrained = isMachineConstrained(this.currentMachineStats);
 
         debug(`${req.url}: Inbound WebSocket request. ${this.queue.length} in queue.`);
 
